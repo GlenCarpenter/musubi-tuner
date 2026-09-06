@@ -1,8 +1,10 @@
 # Krea 2 Edit Training Implementation Plan
 
+**Status: complete as of 6 September 2026.** The LoRA workflow and inference compatibility are verified. Full-checkpoint Image Edit training is tracked separately in [krea2-edit-full-training-plan.md](./krea2-edit-full-training-plan.md).
+
 ## Goal
 
-Add a separate `krea2_edit` LoRA training architecture that produces checkpoints compatible with the `comfyui-krea2edit` fit protocol. Existing Krea 2 text-to-image and full-fine-tuning behavior must remain unchanged.
+Deliver a separate `krea2_edit` LoRA training architecture that produces checkpoints compatible with the `comfyui-krea2edit` fit protocol. Existing Krea 2 Text-to-Image LoRA and full-checkpoint training behavior remains unchanged.
 
 The edit architecture has two conditioning paths:
 
@@ -74,7 +76,7 @@ The DiT returns predictions for every image token. The trainer discards the lead
 
 - Reuse the existing Krea 2 MMDiT loader and `networks.lora_krea2` targets.
 - Keep `krea2` and `krea2_edit` as distinct dataset/trainer architectures.
-- Start with LoRA only. Full fine-tuning is deferred until LoRA behavior is verified in the inference nodes.
+- Keep this rollout LoRA-only. LoRA behavior and inference-node compatibility are now verified; full-checkpoint Image Edit training proceeds under the separate rollout plan.
 - Validate BF16 first, then scaled FP8, ConvRot INT8, block swap, and torch.compile independently.
 - Edit-mode sample generation remains disabled until it accepts reference images and runs the same geometry and multimodal text path as training.
 
@@ -145,6 +147,8 @@ The DiT returns predictions for every image token. The trainer discards the lead
 **Exit criterion:** the Gradio tab builds, print-command tests select all three edit scripts, and loading a runtime TOML restores the correct mode and panels.
 
 ### Phase 7: End-to-end compatibility
+
+**Status: verified on 6 September 2026.** The LoRA workflow has passed inference compatibility verification and is the behavioral baseline for full-checkpoint Image Edit training.
 
 - Compare token geometry against `comfyui-krea2edit` v1.2.4 or newer.
 - Overfit identity, outpaint, and two-reference fixtures.
