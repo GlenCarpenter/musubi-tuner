@@ -273,6 +273,57 @@ class ImageDirectoryDatasource(ImageDatasource):
         return fetcher
 
 
+class Krea2EditImageDirectoryDatasource(ImageDirectoryDatasource):
+    """Image datasource with one exact stem match in each ordered reference directory."""
+
+    def __init__(
+        self,
+        image_directory: str,
+        caption_extension: Optional[str],
+        reference_directories: list[str],
+    ):
+        directories = [str(directory).strip() for directory in reference_directories if str(directory).strip()]
+        if not 1 <= len(directories) <= 2:
+            raise ValueError(f"Krea 2 edit requires one or two reference directories, got {len(directories)}")
+        for directory in directories:
+            if not os.path.isdir(directory):
+                raise ValueError(f"Krea 2 edit reference directory does not exist: {directory}")
+
+        super().__init__(image_directory, caption_extension)
+        self.reference_directories = directories
+        self.control_paths = {}
+        references_by_directory: list[dict[str, str]] = []
+        for directory in directories:
+            references_by_stem: dict[str, str] = {}
+            for reference_path in glob_images(directory):
+                stem = os.path.splitext(os.path.basename(reference_path))[0]
+                if stem in references_by_stem:
+                    raise ValueError(
+                        f"Krea 2 edit reference directory contains duplicate stem {stem!r}: "
+                        f"{references_by_stem[stem]} and {reference_path}"
+                    )
+                references_by_stem[stem] = reference_path
+            references_by_directory.append(references_by_stem)
+
+        missing: list[str] = []
+        for image_path in self.image_paths:
+            stem = os.path.splitext(os.path.basename(image_path))[0]
+            matches = [references_by_stem.get(stem) for references_by_stem in references_by_directory]
+            if any(match is None for match in matches):
+                missing.append(os.path.basename(image_path))
+                continue
+            self.control_paths[image_path] = [match for match in matches if match is not None]
+
+        if missing:
+            examples = ", ".join(sorted(missing)[:5])
+            suffix = "" if len(missing) <= 5 else f" (+{len(missing) - 5} more)"
+            raise ValueError(
+                f"Krea 2 edit found {len(missing)} target images without a stem-matched reference in every directory: "
+                f"{examples}{suffix}"
+            )
+        self.has_control = True
+
+
 class ImageJsonlDatasource(ImageDatasource):
     def __init__(self, image_jsonl_file: str, control_count_per_image: Optional[int] = None, multiple_target: bool = False):
         super().__init__()

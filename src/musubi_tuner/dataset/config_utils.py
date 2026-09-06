@@ -22,6 +22,7 @@ import voluptuous
 from voluptuous import Any, ExactSequence, MultipleInvalid, Object, Schema
 
 from musubi_tuner.dataset.image_video_dataset import DatasetGroup, ImageDataset, VideoDataset
+from musubi_tuner.dataset.architectures import ARCHITECTURE_KREA2_EDIT
 
 import logging
 
@@ -47,6 +48,8 @@ class ImageDatasetParams(BaseDatasetParams):
     image_directory: Optional[str] = None
     image_jsonl_file: Optional[str] = None
     control_directory: Optional[str] = None
+    reference_directory: Optional[str] = None
+    reference_directories: Optional[Sequence[str]] = None
     multiple_target: Optional[bool] = False
 
     # FramePack dependent parameters
@@ -122,6 +125,8 @@ class ConfigSanitizer:
         "image_jsonl_file": str,
         "cache_directory": str,
         "control_directory": str,
+        "reference_directory": str,
+        "reference_directories": [str],
         "multiple_target": bool,
         "fp_latent_window_size": int,
         "fp_1f_clean_indices": [int],
@@ -224,6 +229,9 @@ class BlueprintGenerator:
         sanitized_argparse_namespace = self.sanitizer.sanitize_argparse_namespace(argparse_namespace)
 
         argparse_config = {k: v for k, v in vars(sanitized_argparse_namespace).items() if v is not None}
+        if runtime_params.get("architecture") == ARCHITECTURE_KREA2_EDIT:
+            argparse_config.pop("reference_directory", None)
+            argparse_config.pop("reference_directories", None)
         general_config = sanitized_user_config.get("general", {})
 
         dataset_blueprints = []

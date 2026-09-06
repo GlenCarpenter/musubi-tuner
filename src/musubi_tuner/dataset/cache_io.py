@@ -4,6 +4,7 @@ import os
 from typing import Optional, TYPE_CHECKING, Union
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import save_file
 
 from musubi_tuner.dataset.architectures import (
@@ -15,6 +16,7 @@ from musubi_tuner.dataset.architectures import (
     ARCHITECTURE_IDEOGRAM4_FULL,
     ARCHITECTURE_KANDINSKY5_FULL,
     ARCHITECTURE_KREA2_FULL,
+    ARCHITECTURE_KREA2_EDIT_FULL,
     ARCHITECTURE_QWEN_IMAGE_FULL,
     ARCHITECTURE_WAN_FULL,
     ARCHITECTURE_Z_IMAGE_FULL,
@@ -28,6 +30,11 @@ if TYPE_CHECKING:
 import logging
 
 logger = logging.getLogger(__name__)
+
+KREA2_EDIT_CACHE_SCHEMA_VERSION = "1"
+KREA2_EDIT_FIT_PROTOCOL_VERSION = "1.0.0"
+KREA2_EDIT_TEXT_CACHE_SCHEMA_VERSION = "1"
+KREA2_EDIT_GROUNDING_PROTOCOL_VERSION = "1.0.0"
 
 
 # We use simple if-else approach to support multiple architectures.
@@ -194,6 +201,139 @@ def save_latent_cache_krea2(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
 
+def save_latent_cache_krea2_edit(
+    item_info: ItemInfo,
+    target_latent: torch.Tensor,
+    reference_latents: list[torch.Tensor],
+    *,
+    reference_pixel_sizes: Optional[list[tuple[int, int]]] = None,
+    patch_size: int = 2,
+    fit_protocol_version: str = KREA2_EDIT_FIT_PROTOCOL_VERSION,
+):
+    """Save one Krea 2 edit target and its ordered fitted reference latents."""
+    if target_latent.dim() != 4:
+        raise ValueError(f"target_latent must have shape (C, F, H, W), got {tuple(target_latent.shape)}")
+    if not 1 <= len(reference_latents) <= 2:
+        raise ValueError(f"Krea 2 edit cache requires one or two reference latents, got {len(reference_latents)}")
+    if any(reference.dim() != 4 for reference in reference_latents):
+        raise ValueError("each reference latent must have shape (C, F, H, W)")
+    if any(reference.shape[0] != target_latent.shape[0] for reference in reference_latents):
+        raise ValueError("reference latent channels must match target latent channels")
+    if patch_size < 1:
+        raise ValueError(f"patch_size must be positive, got {patch_size}")
+
+    _, target_frames, target_height, target_width = target_latent.shape
+    if target_height % patch_size or target_width % patch_size:
+        raise ValueError("target latent dimensions must be divisible by the DiT patch size")
+    target_dtype = dtype_to_str(target_latent.dtype)
+    tensors = {
+        f"latents_{target_frames}x{target_height}x{target_width}_{target_dtype}": target_latent.detach().cpu().contiguous()
+    }
+    metadata = {
+        "krea2_edit_cache_schema": KREA2_EDIT_CACHE_SCHEMA_VERSION,
+        "fit_protocol_version": str(fit_protocol_version),
+        "reference_count": str(len(reference_latents)),
+        "target_pixel_height": str(target_height * 8),
+        "target_pixel_width": str(target_width * 8),
+        "target_grid_height": str(target_height // patch_size),
+        "target_grid_width": str(target_width // patch_size),
+    }
+    if reference_pixel_sizes is not None and len(reference_pixel_sizes) != len(reference_latents):
+        raise ValueError("reference_pixel_sizes must contain one entry per reference latent")
+
+    for index, reference in enumerate(reference_latents):
+        _, frames, height, width = reference.shape
+        if height % patch_size or width % patch_size:
+            raise ValueError(f"reference latent {index} dimensions must be divisible by the DiT patch size")
+        reference_dtype = dtype_to_str(reference.dtype)
+        tensors[f"latents_control_{index}_{frames}x{height}x{width}_{reference_dtype}"] = (
+            reference.detach().cpu().contiguous()
+        )
+        grid_height, grid_width = height // patch_size, width // patch_size
+        metadata[f"reference_{index}_grid_height"] = str(grid_height)
+        metadata[f"reference_{index}_grid_width"] = str(grid_width)
+        metadata[f"reference_{index}_offset_height"] = str(max(0.0, (target_height // patch_size - grid_height) / 2))
+        metadata[f"reference_{index}_offset_width"] = str(max(0.0, (target_width // patch_size - grid_width) / 2))
+        pixel_height, pixel_width = (
+            reference_pixel_sizes[index] if reference_pixel_sizes is not None else (height * 8, width * 8)
+        )
+        metadata[f"reference_{index}_pixel_height"] = str(pixel_height)
+        metadata[f"reference_{index}_pixel_width"] = str(pixel_width)
+
+    save_latent_cache_common(item_info, tensors, ARCHITECTURE_KREA2_EDIT_FULL, additional_metadata=metadata)
+
+
+def load_krea2_edit_latent_cache(path: str) -> tuple[torch.Tensor, list[torch.Tensor], dict[str, str]]:
+    """Load and validate a Krea 2 edit latent cache."""
+    with safe_open(path, framework="pt", device="cpu") as reader:
+        metadata = dict(reader.metadata() or {})
+        keys = list(reader.keys())
+        if metadata.get("architecture") != ARCHITECTURE_KREA2_EDIT_FULL:
+            raise ValueError(f"Krea 2 edit cache architecture mismatch: {metadata.get('architecture')!r}")
+        if metadata.get("krea2_edit_cache_schema") != KREA2_EDIT_CACHE_SCHEMA_VERSION:
+            raise ValueError("Unsupported Krea 2 edit cache schema")
+        if metadata.get("fit_protocol_version") != KREA2_EDIT_FIT_PROTOCOL_VERSION:
+            raise ValueError("Unsupported Krea 2 edit fit protocol")
+
+        target_keys = [key for key in keys if key.startswith("latents_") and not key.startswith("latents_control_")]
+        reference_keys = sorted(
+            (key for key in keys if key.startswith("latents_control_")),
+            key=lambda key: int(key.split("_")[2]),
+        )
+        if len(target_keys) != 1:
+            raise ValueError(f"Krea 2 edit cache must contain exactly one target latent, found {len(target_keys)}")
+        try:
+            expected_reference_count = int(metadata["reference_count"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("Krea 2 edit cache has invalid reference_count metadata") from exc
+        if not 1 <= expected_reference_count <= 2 or len(reference_keys) != expected_reference_count:
+            raise ValueError(
+                f"Krea 2 edit cache reference count mismatch: metadata={expected_reference_count}, tensors={len(reference_keys)}"
+            )
+
+        target = reader.get_tensor(target_keys[0])
+        references = [reader.get_tensor(key) for key in reference_keys]
+        actual_indices = [int(key.split("_")[2]) for key in reference_keys]
+        if actual_indices != list(range(expected_reference_count)):
+            raise ValueError(f"Krea 2 edit cache reference indices must be contiguous from zero, got {actual_indices}")
+
+        def require_number(key: str, number_type):
+            try:
+                return number_type(metadata[key])
+            except (KeyError, ValueError) as exc:
+                raise ValueError(f"Krea 2 edit cache has invalid {key} metadata") from exc
+
+        target_grid = (target.shape[-2] // 2, target.shape[-1] // 2)
+        if target.shape[-2] % 2 or target.shape[-1] % 2:
+            raise ValueError("Krea 2 edit target latent dimensions must be divisible by patch size 2")
+        stored_target_grid = (require_number("target_grid_height", int), require_number("target_grid_width", int))
+        if stored_target_grid != target_grid:
+            raise ValueError(f"Krea 2 edit target geometry mismatch: metadata={stored_target_grid}, tensor={target_grid}")
+
+        for index, reference in enumerate(references):
+            if reference.shape[-2] % 2 or reference.shape[-1] % 2:
+                raise ValueError(f"Krea 2 edit reference latent {index} dimensions must be divisible by patch size 2")
+            reference_grid = (reference.shape[-2] // 2, reference.shape[-1] // 2)
+            stored_grid = (
+                require_number(f"reference_{index}_grid_height", int),
+                require_number(f"reference_{index}_grid_width", int),
+            )
+            expected_offsets = (
+                max(0.0, (target_grid[0] - reference_grid[0]) / 2),
+                max(0.0, (target_grid[1] - reference_grid[1]) / 2),
+            )
+            stored_offsets = (
+                require_number(f"reference_{index}_offset_height", float),
+                require_number(f"reference_{index}_offset_width", float),
+            )
+            if stored_grid != reference_grid or stored_offsets != expected_offsets:
+                raise ValueError(
+                    f"Krea 2 edit reference {index} geometry mismatch: "
+                    f"metadata grid/offset={stored_grid}/{stored_offsets}, tensor expects={reference_grid}/{expected_offsets}"
+                )
+    return target, references, metadata
+
+
 def save_latent_cache_kandinsky5(
     item_info: ItemInfo,
     latent: torch.Tensor,
@@ -302,7 +442,12 @@ def save_latent_cache_ideogram4(item_info: ItemInfo, latent: torch.Tensor):
     save_latent_cache_common(item_info, sd, ARCHITECTURE_IDEOGRAM4_FULL)
 
 
-def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], arch_fullname: str):
+def save_latent_cache_common(
+    item_info: ItemInfo,
+    sd: dict[str, torch.Tensor],
+    arch_fullname: str,
+    additional_metadata: Optional[dict[str, str]] = None,
+):
     metadata = {
         "architecture": arch_fullname,
         "width": f"{item_info.original_size[0]}",
@@ -311,6 +456,8 @@ def save_latent_cache_common(item_info: ItemInfo, sd: dict[str, torch.Tensor], a
     }
     if item_info.frame_count is not None:
         metadata["frame_count"] = f"{item_info.frame_count}"
+    if additional_metadata:
+        metadata.update(additional_metadata)
 
     for key, value in sd.items():
         # NaN check and show warning, replace NaN with 0
@@ -416,6 +563,84 @@ def save_text_encoder_output_cache_krea2(item_info: ItemInfo, embed: torch.Tenso
     save_text_encoder_output_cache_common(item_info, sd, ARCHITECTURE_KREA2_FULL)
 
 
+def save_text_encoder_output_cache_krea2_edit(
+    item_info: ItemInfo,
+    embed: torch.Tensor,
+    *,
+    grounding_pixels: int,
+    reference_pixel_sizes: list[tuple[int, int]],
+):
+    """Save fixed-scale image-grounded Qwen3-VL features for Krea 2 edit."""
+    if embed.dim() != 3:
+        raise ValueError(f"embed must have shape (valid_len, selected_layers, hidden), got {tuple(embed.shape)}")
+    if grounding_pixels <= 0:
+        raise ValueError(f"grounding_pixels must be positive for a fixed-scale cache, got {grounding_pixels}")
+    if not 1 <= len(reference_pixel_sizes) <= 2:
+        raise ValueError(f"Krea 2 edit text cache requires one or two reference images, got {len(reference_pixel_sizes)}")
+
+    dtype_str = dtype_to_str(embed.dtype)
+    metadata = {
+        "krea2_edit_text_cache_schema": KREA2_EDIT_TEXT_CACHE_SCHEMA_VERSION,
+        "grounding_protocol_version": KREA2_EDIT_GROUNDING_PROTOCOL_VERSION,
+        "grounding_mode": "fixed",
+        "grounding_pixels": str(grounding_pixels),
+        "reference_count": str(len(reference_pixel_sizes)),
+    }
+    for index, (height, width) in enumerate(reference_pixel_sizes):
+        metadata[f"reference_{index}_pixel_height"] = str(height)
+        metadata[f"reference_{index}_pixel_width"] = str(width)
+
+    save_text_encoder_output_cache_common(
+        item_info,
+        {f"varlen_krea2_vl_embed_{dtype_str}": embed.detach().cpu().contiguous()},
+        ARCHITECTURE_KREA2_EDIT_FULL,
+        merge_existing=False,
+        additional_metadata=metadata,
+    )
+
+
+def validate_krea2_edit_text_encoder_cache(
+    path: str,
+    *,
+    expected_grounding_pixels: Optional[int] = None,
+    expected_reference_count: Optional[int] = None,
+) -> dict[str, str]:
+    """Validate a fixed-scale Krea 2 edit text cache and return its metadata."""
+    with safe_open(path, framework="pt", device="cpu") as reader:
+        metadata = dict(reader.metadata() or {})
+        keys = list(reader.keys())
+        if metadata.get("architecture") != ARCHITECTURE_KREA2_EDIT_FULL:
+            raise ValueError(f"Krea 2 edit text cache architecture mismatch: {metadata.get('architecture')!r}")
+        if metadata.get("krea2_edit_text_cache_schema") != KREA2_EDIT_TEXT_CACHE_SCHEMA_VERSION:
+            raise ValueError("Unsupported Krea 2 edit text cache schema")
+        if metadata.get("grounding_protocol_version") != KREA2_EDIT_GROUNDING_PROTOCOL_VERSION:
+            raise ValueError("Unsupported Krea 2 edit grounding protocol")
+        if metadata.get("grounding_mode") != "fixed":
+            raise ValueError("Krea 2 edit cached text conditioning must declare grounding_mode='fixed'")
+        embed_keys = [key for key in keys if key.startswith("varlen_krea2_vl_embed_")]
+        if len(embed_keys) != 1:
+            raise ValueError(f"Krea 2 edit text cache must contain exactly one embedding tensor, found {len(embed_keys)}")
+        embed = reader.get_tensor(embed_keys[0])
+        if embed.dim() != 3:
+            raise ValueError(f"Krea 2 edit cached embedding must be 3D, got {tuple(embed.shape)}")
+        try:
+            grounding_pixels = int(metadata["grounding_pixels"])
+            reference_count = int(metadata["reference_count"])
+        except (KeyError, ValueError) as exc:
+            raise ValueError("Krea 2 edit text cache has invalid grounding metadata") from exc
+        if grounding_pixels <= 0 or not 1 <= reference_count <= 2:
+            raise ValueError("Krea 2 edit text cache grounding metadata is out of range")
+        if expected_grounding_pixels is not None and grounding_pixels != expected_grounding_pixels:
+            raise ValueError(
+                f"Krea 2 edit text cache grounding scale mismatch: cached={grounding_pixels}, expected={expected_grounding_pixels}"
+            )
+        if expected_reference_count is not None and reference_count != expected_reference_count:
+            raise ValueError(
+                f"Krea 2 edit text cache reference count mismatch: cached={reference_count}, expected={expected_reference_count}"
+            )
+    return metadata
+
+
 def save_text_encoder_output_cache_kandinsky5(
     item_info: ItemInfo, text_embeds: torch.Tensor, pooled_embed: torch.Tensor, attention_mask: torch.Tensor
 ):
@@ -489,6 +714,7 @@ def save_text_encoder_output_cache_common(
     sd: dict[str, torch.Tensor],
     arch_fullname: str,
     merge_existing: bool = True,
+    additional_metadata: Optional[dict[str, str]] = None,
 ):
     # merge_existing keeps keys written by previous passes (e.g. HunyuanVideo caches LLM and CLIP separately).
     # Single-pass architectures that write their full key set at once should pass merge_existing=False so the
@@ -528,5 +754,8 @@ def save_text_encoder_output_cache_common(
     else:
         text_encoder_output_dir = os.path.dirname(item_info.text_encoder_output_cache_path)
         os.makedirs(text_encoder_output_dir, exist_ok=True)
+
+    if additional_metadata:
+        metadata.update(additional_metadata)
 
     safetensors_utils.mem_eff_save_file(sd, item_info.text_encoder_output_cache_path, metadata=metadata)

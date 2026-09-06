@@ -196,3 +196,24 @@ def get_krea2_prompt_embeds(encoder: Qwen3VLConditioner, prompts: list[str]) -> 
     """
     hiddens, mask = encoder(prompts)
     return hiddens, mask.to(dtype=torch.bool)
+
+
+@torch.no_grad()
+def get_krea2_edit_prompt_embeds(
+    encoder: Qwen3VLConditioner,
+    prompts: list[str],
+    reference_images: list[list],
+    *,
+    grounding_min_pixels: int = 384,
+    grounding_max_pixels: int = 768,
+    grounding_size_selector=None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return image-grounded Krea 2 edit features and their valid-token mask."""
+    hiddens, mask = encoder.forward_with_images(
+        prompts,
+        reference_images,
+        grounding_min_pixels=grounding_min_pixels,
+        grounding_max_pixels=grounding_max_pixels,
+        grounding_size_selector=grounding_size_selector,
+    )
+    return hiddens, mask.to(dtype=torch.bool)

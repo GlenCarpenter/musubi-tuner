@@ -1,0 +1,5 @@
+from musubi_tuner.krea2_edit_cache_text_encoder_outputs import main
+
+
+if __name__ == "__main__":
+    main()

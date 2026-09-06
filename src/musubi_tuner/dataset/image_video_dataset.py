@@ -90,6 +90,7 @@ from musubi_tuner.dataset.datasources import (  # noqa: F401
     ContentDatasource,
     ImageDatasource,
     ImageDirectoryDatasource,
+    Krea2EditImageDirectoryDatasource,
     ImageJsonlDatasource,
     VideoDatasource,
     VideoDirectoryDatasource,
@@ -277,6 +278,8 @@ class ImageDataset(BaseDataset):
         image_directory: Optional[str] = None,
         image_jsonl_file: Optional[str] = None,
         control_directory: Optional[str] = None,
+        reference_directory: Optional[str] = None,
+        reference_directories: Optional[Sequence[str]] = None,
         cache_directory: Optional[str] = None,
         multiple_target: bool = False,
         fp_latent_window_size: Optional[int] = 9,
@@ -302,6 +305,10 @@ class ImageDataset(BaseDataset):
         self.image_directory = image_directory
         self.image_jsonl_file = image_jsonl_file
         self.control_directory = control_directory
+        self.reference_directories = list(reference_directories or ())
+        if not self.reference_directories and reference_directory:
+            self.reference_directories = [reference_directory]
+        self.reference_directory = reference_directory
         self.multiple_target = multiple_target
         self.fp_latent_window_size = fp_latent_window_size
         self.fp_1f_clean_indices = fp_1f_clean_indices
@@ -329,10 +336,19 @@ class ImageDataset(BaseDataset):
         elif self.architecture == ARCHITECTURE_HIDREAM_O1:
             control_count_per_image = None  # can be multiple control/reference images
 
+        if self.architecture == ARCHITECTURE_KREA2_EDIT and batch_size != 1:
+            raise ValueError(f"Krea 2 edit requires batch_size=1, got {batch_size}")
+
         if image_directory is not None:
-            self.datasource = ImageDirectoryDatasource(
-                image_directory, caption_extension, control_directory, control_count_per_image, multiple_target
-            )
+            if self.architecture == ARCHITECTURE_KREA2_EDIT:
+                self.datasource = Krea2EditImageDirectoryDatasource(
+                    image_directory, caption_extension, self.reference_directories
+                )
+                self.no_resize_control = True
+            else:
+                self.datasource = ImageDirectoryDatasource(
+                    image_directory, caption_extension, control_directory, control_count_per_image, multiple_target
+                )
         elif image_jsonl_file is not None:
             self.datasource = ImageJsonlDatasource(image_jsonl_file, control_count_per_image, multiple_target)
         else:
@@ -353,6 +369,8 @@ class ImageDataset(BaseDataset):
             metadata["image_jsonl_file"] = os.path.basename(self.image_jsonl_file)
         if self.control_directory is not None:
             metadata["control_directory"] = os.path.basename(self.control_directory)
+        if self.reference_directories:
+            metadata["reference_directories"] = [os.path.basename(path) for path in self.reference_directories]
         metadata["has_control"] = self.has_control
         return metadata
 
